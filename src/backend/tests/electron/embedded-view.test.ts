@@ -1,7 +1,11 @@
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import vm from "node:vm";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const require = createRequire(import.meta.url);
 const {
@@ -599,5 +603,311 @@ describe("kept logins", () => {
     await done;
     expect(clears(fresh)).toEqual([0, 0, 0, 0]);
     expect(views[views.length - 1].webContents.close).not.toHaveBeenCalled();
+  });
+});
+
+// The real desktop-settings module over a temporary app data folder.
+type Settings = {
+  getDesktopSettings: () => Record<string, unknown>;
+  saveDesktopSettings: (value: Record<string, unknown>) => unknown;
+  readEmbeddedLoginKey: () => string | null;
+  saveEmbeddedLoginKey: (key: string) => void;
+  deleteEmbeddedLoginKey: () => void;
+};
+const folders: string[] = [];
+afterEach(() =>
+  folders
+    .splice(0)
+    .forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })),
+);
+function settingsIn(directory: string): Settings {
+  const module = { exports: {} };
+  vm.runInNewContext(
+    fs.readFileSync(
+      path.resolve(
+        import.meta.dirname,
+        "../../../../electron/desktop-settings.cjs",
+      ),
+      "utf8",
+    ),
+    {
+      module,
+      process,
+      require: (id: string) =>
+        id === "electron"
+          ? { app: { getPath: () => directory } }
+          : id === "fs"
+            ? fs
+            : path,
+    },
+  );
+  return module.exports as Settings;
+}
+
+describe("stored logins", () => {
+  let userData: string;
+  let partitions: string;
+  let settings: Settings;
+  let dialog: { showMessageBox: ReturnType<typeof vi.fn> };
+  let encryption: boolean;
+  let grants = 0;
+
+  // A new manager, the way a new process starts: sweep first.
+  function start(overrides: Partial<Settings> = {}) {
+    dialog = { showMessageBox: vi.fn().mockResolvedValue({ response: 0 }) };
+    manager = createEmbeddedViews({
+      WebContentsView: FakeView,
+      session: { fromPartition },
+      getMainWindow: () => ({ contentView, isDestroyed: () => false }),
+      log,
+      desktopSettings: { ...settings, ...overrides },
+      encryptionAvailable: () => encryption,
+      dialog,
+    });
+    manager.sweepOldLogins(partitions);
+    return manager;
+  }
+  function openGranted(
+    id: string,
+    url: string,
+    extra: Record<string, unknown> = {},
+  ): string {
+    const next = (++grants).toString(16).padStart(48, "0");
+    grant(next, url, { userId: "user-1", ignoreCert: false, ...extra });
+    manager.open({
+      id,
+      grant: next,
+      pluginId: extra.pluginId ?? "web-endpoint",
+      bounds,
+    });
+    return fromPartition.mock.calls[fromPartition.mock.calls.length - 1][0];
+  }
+  // Stands in for the folder Electron makes for a persist: partition.
+  function folderFor(name: string): string {
+    const folder = path.join(partitions, name.replace(/^persist:/, ""));
+    fs.mkdirSync(folder, { recursive: true });
+    return folder;
+  }
+  const tagOf = (name: string) =>
+    /^persist:embedded-login-([0-9a-f]{8})-[0-9a-f]{64}$/.exec(name)?.[1];
+  const keyFile = () => path.join(userData, "embedded-logins.json");
+  const storedSetting = () =>
+    JSON.parse(
+      fs.readFileSync(path.join(userData, "desktop-settings.json"), "utf8"),
+    ).keepEmbeddedLogins;
+
+  beforeEach(() => {
+    userData = fs.mkdtempSync(path.join(os.tmpdir(), "termix-logins-"));
+    folders.push(userData);
+    partitions = path.join(userData, "Partitions");
+    settings = settingsIn(userData);
+    encryption = true;
+  });
+
+  it("keeps #1926's memory sessions while the setting is off", () => {
+    start();
+    const name = openGranted("a", "https://pi.example/");
+    expect(name).toMatch(/^embedded-login-[0-9a-f]{64}$/);
+    expect(manager.loginState()).toEqual({
+      keepEmbeddedLogins: false,
+      embeddedLoginsStored: false,
+    });
+    expect(fs.existsSync(keyFile())).toBe(false);
+  });
+
+  it("stores a login under a name the next process finds again", () => {
+    start();
+    expect(manager.setKeepLogins(true)).toEqual({ success: true });
+    expect(manager.loginState()).toEqual({
+      keepEmbeddedLogins: true,
+      embeddedLoginsStored: true,
+    });
+    const name = openGranted("a", "https://pi.example/");
+    expect(tagOf(name)).toBeTruthy();
+    const others = [
+      openGranted("b", "https://pi.example/", { userId: "user-2" }),
+      openGranted("c", "https://pi.example/", { pluginId: "other" }),
+      openGranted("d", "https://pihole.example/"),
+      openGranted("e", "https://pi.example/", { ignoreCert: true }),
+    ];
+    expect(new Set([name, ...others]).size).toBe(5);
+    expect(others.every((other) => tagOf(other) === tagOf(name))).toBe(true);
+    // Plain urls, grants without a person and this machine stay in memory.
+    manager.open({ id: "plain", url: "https://pi.example/", bounds });
+    const own = [
+      fromPartition.mock.calls[fromPartition.mock.calls.length - 1][0],
+      openGranted("none", "https://pi.example/", { userId: undefined }),
+      openGranted("loop", "http://127.0.0.1:8080/"),
+    ];
+    for (const other of own) expect(other).toMatch(/^embedded-view-/);
+
+    folderFor(name);
+    start();
+    expect(openGranted("a", "https://pi.example/")).toBe(name);
+    expect(fs.existsSync(path.join(partitions, name.slice(8)))).toBe(true);
+  });
+
+  it("stores nothing and deletes nothing while encryption is unavailable", () => {
+    start();
+    manager.setKeepLogins(true);
+    const name = openGranted("a", "https://pi.example/");
+    const folder = folderFor(name);
+    encryption = false;
+    start();
+    expect(manager.loginState().embeddedLoginsStored).toBe(false);
+    expect(openGranted("a", "https://pi.example/")).toMatch(
+      /^embedded-login-[0-9a-f]{64}$/,
+    );
+    expect(fs.existsSync(keyFile())).toBe(true);
+    expect(fs.existsSync(folder)).toBe(true);
+    // The tag still decides what the sweep keeps.
+    const stale = folderFor("persist:embedded-login-00000000-x");
+    start();
+    expect(fs.existsSync(folder)).toBe(true);
+    expect(fs.existsSync(stale)).toBe(false);
+  });
+
+  it("writes a key only when needed, replacing a missing or malformed one", () => {
+    settings.saveDesktopSettings({ keepEmbeddedLogins: true });
+    const stale = folderFor("persist:embedded-login-12345678-old");
+    start();
+    // No key: every folder goes.
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(keyFile())).toBe(false);
+    const first = openGranted("a", "https://pi.example/");
+    expect(settings.readEmbeddedLoginKey()).toMatch(/^[0-9a-f]{64}$/);
+
+    fs.writeFileSync(keyFile(), '{"key":"not-a-key"}');
+    start();
+    const second = openGranted("a", "https://pi.example/");
+    expect(tagOf(second)).not.toBe(tagOf(first));
+    expect(settings.readEmbeddedLoginKey()).not.toBe("not-a-key");
+  });
+
+  it("falls back to memory for the run when the key can't be written", () => {
+    settings.saveDesktopSettings({ keepEmbeddedLogins: true });
+    start({
+      saveEmbeddedLoginKey: () => {
+        throw new Error("EROFS");
+      },
+    });
+    expect(openGranted("a", "https://pi.example/")).toMatch(
+      /^embedded-login-[0-9a-f]{64}$/,
+    );
+    expect(manager.loginState().embeddedLoginsStored).toBe(false);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("EROFS"));
+  });
+
+  it("switching off closes and clears stored pages only, and the next start sweeps them", () => {
+    start();
+    manager.setKeepLogins(true);
+    const stored = openGranted("stored", "https://pi.example/");
+    const storedView = views[views.length - 1];
+    folderFor(stored);
+    const neverOpened = folderFor(
+      `persist:embedded-login-${tagOf(stored)}-${"0".repeat(64)}`,
+    );
+    // A memory view, opened while encryption was briefly unavailable.
+    encryption = false;
+    const memory = openGranted("memory", "https://other.example/");
+    const memoryView = views[views.length - 1];
+    encryption = true;
+    const pending = (++grants).toString(16).padStart(48, "0");
+    grant(pending, "https://other.example/", {
+      userId: "user-1",
+      ignoreCert: false,
+    });
+
+    expect(manager.setKeepLogins(false)).toEqual({ success: true });
+    expect(fs.existsSync(keyFile())).toBe(false);
+    expect(storedSetting()).toBe(false);
+    expect(storedView.webContents.close).toHaveBeenCalled();
+    expect(sessions.get(stored)?.clearStorageData).toHaveBeenCalled();
+    expect(memoryView.webContents.close).not.toHaveBeenCalled();
+    expect(sessions.get(memory)?.clearStorageData).not.toHaveBeenCalled();
+    // The grant still opens, in memory.
+    manager.open({
+      id: "later",
+      grant: pending,
+      pluginId: "web-endpoint",
+      bounds,
+    });
+    expect(views[views.length - 1].webContents.loadURL).toHaveBeenCalled();
+    expect(
+      fromPartition.mock.calls[fromPartition.mock.calls.length - 1][0],
+    ).toBe(memory);
+
+    start();
+    expect(fs.existsSync(path.join(partitions, stored.slice(8)))).toBe(false);
+    expect(fs.existsSync(neverOpened)).toBe(false);
+  });
+
+  it("signing out retires the key at once and clears every session, as #1926 does", async () => {
+    start();
+    manager.setKeepLogins(true);
+    const stored = openGranted("stored", "https://pi.example/");
+    folderFor(stored);
+    const neverOpened = folderFor(
+      `persist:embedded-login-${tagOf(stored)}-${"0".repeat(64)}`,
+    );
+    encryption = false;
+    const memory = openGranted("memory", "https://other.example/");
+    encryption = true;
+    sessions
+      .get(stored)
+      ?.clearStorageData.mockRejectedValueOnce(new Error("busy"));
+
+    const done = manager.forgetSessions();
+    // Before any clear has settled, nothing on disk reopens the login.
+    expect(fs.existsSync(keyFile())).toBe(false);
+    const next = createEmbeddedViews({
+      WebContentsView: FakeView,
+      session: { fromPartition },
+      getMainWindow: () => ({ contentView, isDestroyed: () => false }),
+      desktopSettings: settings,
+      encryptionAvailable: () => true,
+    });
+    next.sweepOldLogins(partitions);
+    expect(fs.existsSync(neverOpened)).toBe(false);
+    await done;
+
+    expect(sessions.get(stored)?.clearStorageData).toHaveBeenCalled();
+    expect(sessions.get(memory)?.clearStorageData).toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("busy"));
+    // The setting stays on, and the next login gets a new key.
+    expect(storedSetting()).toBe(true);
+    const after = openGranted("stored", "https://pi.example/");
+    expect(tagOf(after)).toBeTruthy();
+    expect(tagOf(after)).not.toBe(tagOf(stored));
+    expect(dialog.showMessageBox).not.toHaveBeenCalled();
+  });
+
+  it("signing out twice clears only what came after the first", async () => {
+    start();
+    manager.setKeepLogins(true);
+    const first = openGranted("a", "https://pi.example/");
+    await manager.forgetSessions();
+    const second = openGranted("a", "https://pi.example/");
+    await manager.forgetSessions();
+    expect(sessions.get(first)?.clearStorageData).toHaveBeenCalledTimes(1);
+    expect(sessions.get(second)?.clearStorageData).toHaveBeenCalledTimes(1);
+  });
+
+  it("turns off and on again with the same view id", () => {
+    start();
+    const names: string[] = [];
+    for (const on of [true, false, true, false, true]) {
+      manager.setKeepLogins(on);
+      names.push(openGranted("same-id", "https://pi.example/"));
+    }
+    const [on1, off1, on2, off2, on3] = names;
+    expect(new Set([on1, on2, on3].map(tagOf)).size).toBe(3);
+    expect(tagOf(off1)).toBeUndefined();
+    expect(off2).toBe(off1);
+    // Each switch-off closed the stored view and cleared its session only.
+    expect(sessions.get(on1)?.clearStorageData).toHaveBeenCalledTimes(1);
+    expect(sessions.get(on2)?.clearStorageData).toHaveBeenCalledTimes(1);
+    expect(sessions.get(on3)?.clearStorageData).not.toHaveBeenCalled();
+    expect(sessions.get(off1)?.clearStorageData).not.toHaveBeenCalled();
   });
 });

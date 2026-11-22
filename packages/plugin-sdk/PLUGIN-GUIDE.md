@@ -1248,8 +1248,13 @@ exports with props is `ui.api.txt` in the Termix repo
   only a grant can trust a bad certificate (desktop only). It fills its element, hides while a dialog or menu is
   open, and each grant works for ten minutes for the person who asked. In the desktop app a fresh grant for the same
   person, plugin, origin and certificate rule keeps the page's login across reloads and reopened tabs. That login is
-  kept in memory only and ends when Termix quits or the person signs out, and pages on this computer (loopback) always
-  start signed out. `url` still works for a plugin in the page.
+  kept in memory only and ends when Termix quits or the person signs out. With the desktop setting to keep logins on,
+  and only while the OS can encrypt data and Termix can write its app data (otherwise it stays in memory), it is
+  stored on disk: what the website keeps itself survives a restart, until the website ends it, but session cookies
+  and `sessionStorage` don't. Cookies are encrypted, other site data is not. Turning the setting off or signing out
+  clears stored logins; if Termix can't clear them, it shows an error, and when it can't record the change either,
+  they may still work after a restart. Pages on this computer (loopback) always start signed out. `url` still works
+  for a plugin in the page.
 - Serial ports in the browser: `app.serial.request({ baudRate, dataBits, stopBits, parity, filters }, { onData,
 onClose })` (needs `device:serial`, call it from a click in your frame) opens the browser's port picker and
   resolves `{ write(bytes), close() }` for the port the person picked, or null when they picked none. Check

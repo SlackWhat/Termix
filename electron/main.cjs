@@ -555,6 +555,9 @@ const embeddedViews = createEmbeddedViews({
   session,
   getMainWindow: () => mainWindow,
   log: logToFile,
+  desktopSettings,
+  encryptionAvailable: getSafeStorageAvailable,
+  dialog,
 });
 
 // Only the app's own page, in the main window's top frame, may call main.
@@ -1863,13 +1866,22 @@ ipc.handle("external-browser-login", async (_event, authUrl, callbackPort) => {
 // Desktop-only settings, such as whether hosts connect from this device or
 // through the linked server by default.
 ipc.handle("get-desktop-settings", () => {
-  return desktopSettings.getDesktopSettings();
+  return {
+    ...desktopSettings.getDesktopSettings(),
+    embeddedLoginsStored: embeddedViews.loginState().embeddedLoginsStored,
+  };
 });
 
+// keepEmbeddedLogins changes only in a save of that key alone (the switch),
+// so a stale settings object sent with other keys can't turn it back on.
 ipc.handle("save-desktop-settings", (_event, settings) => {
-  return desktopSettings.saveDesktopSettings(
-    desktopSettings.rendererSettings(settings),
-  );
+  const { keepEmbeddedLogins, ...others } =
+    desktopSettings.rendererSettings(settings);
+  const result =
+    keepEmbeddedLogins !== undefined && Object.keys(settings).length === 1
+      ? embeddedViews.setKeepLogins(keepEmbeddedLogins)
+      : desktopSettings.saveDesktopSettings(others);
+  return { ...result, ...embeddedViews.loginState() };
 });
 
 // Text for the first close to tray notice, in the user's language. The main
@@ -2270,6 +2282,10 @@ app.whenReady().then(async () => {
     app.setAppUserModelId(windowsAppUserModelId);
   }
   createMenu();
+  // Before any embedded view opens.
+  embeddedViews.sweepOldLogins(
+    path.join(app.getPath("userData"), "Partitions"),
+  );
   await clearElectronClientCacheIfBuildChanged();
   await clearElectronJwtCookiesAtStartup();
 

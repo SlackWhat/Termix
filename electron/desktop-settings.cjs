@@ -38,6 +38,9 @@ const DEFAULTS = {
   macTrayIcon: "monochrome",
   closeToTray: true,
   trayNoticeShown: false,
+  // Embedded-page logins kept on disk across restarts. Only the embedded view
+  // manager writes it (see setKeepLogins in embedded-view.cjs).
+  keepEmbeddedLogins: false,
 };
 
 // The settings the app's page may change. The rest are set by the main
@@ -45,6 +48,7 @@ const DEFAULTS = {
 const RENDERER_SETTINGS = {
   defaultConnectionOrigin: (value) => value === "local" || value === "remote",
   closeToTray: (value) => typeof value === "boolean",
+  keepEmbeddedLogins: (value) => typeof value === "boolean",
 };
 
 function rendererSettings(settings) {
@@ -68,6 +72,35 @@ function saveDesktopSettings(settings) {
     ...settings,
   });
   return { success: true };
+}
+
+// The key that names stored embedded-page logins, in a file of its own so
+// the page never reads it. Missing or malformed is no key; a file that cannot
+// be read throws.
+const LOGIN_KEY_FILE = "embedded-logins.json";
+
+function readEmbeddedLoginKey() {
+  let text;
+  try {
+    text = fs.readFileSync(dataPath(LOGIN_KEY_FILE), "utf8");
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const { key } = JSON.parse(text);
+    return typeof key === "string" && /^[0-9a-f]{64}$/.test(key) ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveEmbeddedLoginKey(key) {
+  writeJson(dataPath(LOGIN_KEY_FILE), { key });
+}
+
+function deleteEmbeddedLoginKey() {
+  fs.rmSync(dataPath(LOGIN_KEY_FILE), { force: true });
 }
 
 // The server a 2.8 or older desktop was pointed at, if any.
@@ -100,6 +133,9 @@ module.exports = {
   rendererSettings,
   getDesktopSettings,
   saveDesktopSettings,
+  readEmbeddedLoginKey,
+  saveEmbeddedLoginKey,
+  deleteEmbeddedLoginKey,
   getPreviousServerUrl,
   removeOldSyncFiles,
 };

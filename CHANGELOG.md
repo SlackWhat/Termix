@@ -6,6 +6,7 @@
 
 - Diagnostics report in the desktop app includes the update status and the app's own log
 - Plugins tab: plugins made for an older Termix can be updated right from the notice that lists them
+- Desktop app: an opt-in setting stores the login data that web pages shown through a plugin grant keep themselves, so those logins can survive a restart. It needs OS encryption, and turning it off or signing out of Termix clears it, or shows an error when it can't (#1972)
 
 ### Changed
 

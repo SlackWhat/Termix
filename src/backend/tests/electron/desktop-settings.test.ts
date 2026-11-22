@@ -76,3 +76,47 @@ describe("desktop settings", () => {
     });
   });
 });
+
+describe("kept embedded logins", () => {
+  it("is off by default and only takes a boolean from the page", () => {
+    const { getDesktopSettings, rendererSettings } = load();
+    expect(getDesktopSettings().keepEmbeddedLogins).toBe(false);
+    expect(rendererSettings({ keepEmbeddedLogins: true } as never)).toEqual({
+      keepEmbeddedLogins: true,
+    });
+    for (const value of ["true", 1, null, {}]) {
+      expect(rendererSettings({ keepEmbeddedLogins: value } as never)).toEqual(
+        {},
+      );
+    }
+  });
+
+  it("keeps the login key in a file of its own, readable by this user only", () => {
+    const settings = load();
+    const key = "c".repeat(64);
+    expect(settings.readEmbeddedLoginKey()).toBeNull();
+    settings.saveEmbeddedLoginKey(key as never);
+    expect(settings.readEmbeddedLoginKey()).toBe(key);
+    expect(JSON.stringify(settings.getDesktopSettings())).not.toContain(key);
+    const file = path.join(temporary[0], "embedded-logins.json");
+    if (process.platform !== "win32") {
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+    }
+    settings.deleteEmbeddedLoginKey();
+    expect(fs.existsSync(file)).toBe(false);
+    // Deleting a missing key is not a failure.
+    expect(() => settings.deleteEmbeddedLoginKey()).not.toThrow();
+  });
+
+  it("reads a malformed key as no key, and throws when the file can't be read", () => {
+    const settings = load();
+    const file = path.join(temporary[0], "embedded-logins.json");
+    for (const text of ["{", '{"key":"short"}', '{"key":1}', "null"]) {
+      fs.writeFileSync(file, text);
+      expect(settings.readEmbeddedLoginKey()).toBeNull();
+    }
+    fs.rmSync(file);
+    fs.mkdirSync(file);
+    expect(() => settings.readEmbeddedLoginKey()).toThrow();
+  });
+});

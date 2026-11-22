@@ -1,4 +1,6 @@
 const { createHash, randomBytes, randomUUID } = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
 const {
   isolatedUrl,
   KEPT_LOGIN_PARTITION_PREFIX,
@@ -44,14 +46,38 @@ function isLoopbackHost(host) {
  * that is cleared when the view closes. Signing out of Termix
  * (forgetSessions) starts a new generation, so nothing opened after it
  * reaches the sessions from before.
+ *
+ * With the keepEmbeddedLogins setting on and OS encryption available, those
+ * shared sessions are stored on disk instead (persist:), named from a random
+ * key in its own file, so a website's own login can outlive a restart. Every
+ * reset deletes that key first, which retires every stored login at once,
+ * opened in this run or not. If the delete fails, the setting is written off
+ * instead and an error is shown.
  */
 const MAX_GRANTS = 500;
+
+// English like the client certificate dialog: main has no translations, and
+// this must show even when the signed-out page is gone.
+const RESET_FAILED =
+  "Saved web page logins could not be cleared. Keeping them is now off, and Termix will try again at the next start.";
+const RESET_AND_FALLBACK_FAILED =
+  "Saved web page logins could not be cleared, and they may still work after Termix restarts. Check that Termix can write to its app data folder.";
+
+// A cleanup hint in stored folder names, not proof of anything.
+function keyTag(key) {
+  return createHash("sha256").update(key).digest("hex").slice(0, 8);
+}
 
 function createEmbeddedViews({
   WebContentsView,
   session,
   getMainWindow,
   log = () => {},
+  // Settings and key file (desktop-settings.cjs); without them nothing is
+  // stored.
+  desktopSettings = null,
+  encryptionAvailable = () => false,
+  dialog = null,
 }) {
   const views = new Map();
   const grants = new Map();
@@ -63,6 +89,90 @@ function createEmbeddedViews({
   // when no view uses them any more.
   const sharedSessions = new Set();
   const lockedDown = new WeakSet();
+  // Shared sessions stored on disk.
+  const storedSessions = new WeakSet();
+  // The stored-login key once read or written in this run.
+  let key = null;
+  // A key read, write or delete failed: memory sessions for the rest of the
+  // run, unless the switch is turned on again.
+  let keyFailed = false;
+
+  function keepSetting() {
+    return desktopSettings?.getDesktopSettings().keepEmbeddedLogins === true;
+  }
+
+  // The one effective mode: new logins are stored in this run.
+  function isStoring() {
+    if (!desktopSettings || keyFailed || !keepSetting()) return false;
+    try {
+      return encryptionAvailable() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  function loginState() {
+    return {
+      keepEmbeddedLogins: keepSetting(),
+      embeddedLoginsStored: isStoring(),
+    };
+  }
+
+  // The key for a stored login, written when first needed. Null after a
+  // failure, for memory sessions.
+  function storedKey() {
+    if (key) return key;
+    try {
+      key = desktopSettings.readEmbeddedLoginKey();
+      if (!key) {
+        const fresh = randomBytes(32).toString("hex");
+        desktopSettings.saveEmbeddedLoginKey(fresh);
+        key = fresh;
+      }
+      return key;
+    } catch (error) {
+      log(`[embedded-view] login key failed: ${error}`);
+      keyFailed = true;
+      key = null;
+      return null;
+    }
+  }
+
+  function showError(message) {
+    try {
+      void Promise.resolve(
+        dialog?.showMessageBox({
+          type: "error",
+          title: "Saved logins",
+          message,
+        }),
+      ).catch(() => {});
+    } catch {
+      /* the log has it */
+    }
+  }
+
+  // Deletes the key, so no later start reopens a stored login. If that
+  // fails, the setting written off is the record instead. False on failure.
+  function retireKey() {
+    key = null;
+    if (!desktopSettings) return true;
+    try {
+      desktopSettings.deleteEmbeddedLoginKey();
+      return true;
+    } catch (error) {
+      log(`[embedded-view] login key delete failed: ${error}`);
+    }
+    keyFailed = true;
+    try {
+      desktopSettings.saveDesktopSettings({ keepEmbeddedLogins: false });
+      showError(RESET_FAILED);
+    } catch (error) {
+      log(`[embedded-view] keepEmbeddedLogins write failed: ${error}`);
+      showError(RESET_AND_FALLBACK_FAILED);
+    }
+    return false;
+  }
 
   function addGrant(payload = {}) {
     const grant = String(payload.grant || "");
@@ -108,6 +218,19 @@ function createEmbeddedViews({
   // The shared session a target's view uses, or null for one of its own.
   function partitionFor(target, url) {
     if (!target.userId || isLoopbackHost(url.hostname)) return null;
+    const stored = isStoring() ? storedKey() : null;
+    if (stored) {
+      const scope = JSON.stringify([
+        "embedded-login",
+        stored,
+        target.userId,
+        target.pluginId,
+        url.origin,
+        target.ignoreCert === true,
+      ]);
+      const hash = createHash("sha256").update(scope).digest("hex");
+      return `persist:${KEPT_LOGIN_PARTITION_PREFIX}${keyTag(stored)}-${hash}`;
+    }
     const scope = JSON.stringify([
       "embedded-login",
       secret,
@@ -173,28 +296,126 @@ function createEmbeddedViews({
    * sessions, no grants and no views. Then each clear of the old shared
    * sessions runs on its own; one that fails is logged and its data stays
    * out of reach until the app quits. One sign-out can call this twice, and a
-   * login made in between then has to sign in to its pages again.
+   * login made in between then has to sign in to its pages again. Stored
+   * logins are retired first (retireKey), before anything else.
    */
   function forgetSessions() {
+    retireKey();
     generation += 1;
     const retired = [...sharedSessions];
     sharedSessions.clear();
     grants.clear();
     destroyAll();
+    return Promise.all(retired.map(clearSession)).then(() => undefined);
+  }
+
+  function clearSession(isolated) {
     return Promise.all(
-      retired.flatMap((isolated) =>
-        [
-          "clearStorageData",
-          "clearCache",
-          "clearAuthCache",
-          "closeAllConnections",
-        ].map((method) =>
-          new Promise((resolve) => resolve(isolated[method]())).catch((error) =>
-            log(`[embedded-view] ${method} failed: ${error}`),
-          ),
+      [
+        "clearStorageData",
+        "clearCache",
+        "clearAuthCache",
+        "closeAllConnections",
+      ].map((method) =>
+        new Promise((resolve) => resolve(isolated[method]())).catch((error) =>
+          log(`[embedded-view] ${method} failed: ${error}`),
         ),
       ),
-    ).then(() => undefined);
+    );
+  }
+
+  /**
+   * The keepEmbeddedLogins switch, the only writer of that setting. On
+   * writes a fresh key, then the setting. Off retires the key, writes the
+   * setting, then closes the views on stored sessions and clears those;
+   * memory sessions, their views and grants stay.
+   */
+  function setKeepLogins(on) {
+    if (!desktopSettings) {
+      return { success: false, error: "Saved logins are not available" };
+    }
+    if (on) {
+      if (keepSetting() && !keyFailed) return { success: true };
+      try {
+        const fresh = randomBytes(32).toString("hex");
+        desktopSettings.saveEmbeddedLoginKey(fresh);
+        desktopSettings.saveDesktopSettings({ keepEmbeddedLogins: true });
+        key = fresh;
+        keyFailed = false;
+        return { success: true };
+      } catch (error) {
+        log(`[embedded-view] turning saved logins on failed: ${error}`);
+        return { success: false, error: String(error?.message || error) };
+      }
+    }
+    let result = retireKey()
+      ? { success: true }
+      : { success: false, error: "Saved logins could not be cleared" };
+    try {
+      desktopSettings.saveDesktopSettings({ keepEmbeddedLogins: false });
+    } catch (error) {
+      log(`[embedded-view] keepEmbeddedLogins write failed: ${error}`);
+      if (result.success) {
+        result = { success: false, error: String(error?.message || error) };
+      }
+    }
+    const stored = [...sharedSessions].filter((s) => storedSessions.has(s));
+    for (const [id, entry] of [...views]) {
+      if (storedSessions.has(entry.session)) destroy(id);
+    }
+    for (const isolated of stored) {
+      sharedSessions.delete(isolated);
+      void clearSession(isolated);
+    }
+    return result;
+  }
+
+  /**
+   * At start, before any view: removes stored-login folders no key reaches.
+   * Setting off: the key goes and so does every folder. Setting on: only
+   * folders tagged with the current key stay (none without a key). Errors
+   * are logged and the sweep runs again next start.
+   */
+  function sweepOldLogins(partitionsDir) {
+    if (!desktopSettings) return;
+    let keep = null;
+    if (keepSetting()) {
+      try {
+        key = desktopSettings.readEmbeddedLoginKey();
+      } catch (error) {
+        log(`[embedded-view] login key read failed: ${error}`);
+        keyFailed = true;
+        return;
+      }
+      if (key) keep = `${KEPT_LOGIN_PARTITION_PREFIX}${keyTag(key)}-`;
+    } else {
+      try {
+        desktopSettings.deleteEmbeddedLoginKey();
+      } catch (error) {
+        log(`[embedded-view] login key delete failed: ${error}`);
+      }
+    }
+    let names = [];
+    try {
+      names = fs.readdirSync(partitionsDir);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        log(`[embedded-view] reading ${partitionsDir} failed: ${error}`);
+      }
+      return;
+    }
+    for (const name of names) {
+      if (!name.startsWith(KEPT_LOGIN_PARTITION_PREFIX)) continue;
+      if (keep && name.startsWith(keep)) continue;
+      try {
+        fs.rmSync(path.join(partitionsDir, name), {
+          recursive: true,
+          force: true,
+        });
+      } catch (error) {
+        log(`[embedded-view] removing ${name} failed: ${error}`);
+      }
+    }
   }
 
   function open(options = {}) {
@@ -234,6 +455,7 @@ function createEmbeddedViews({
     );
     lockDown(isolated);
     if (partition) sharedSessions.add(isolated);
+    if (partition?.startsWith("persist:")) storedSessions.add(isolated);
 
     const preferences = {
       session: isolated,
@@ -335,6 +557,9 @@ function createEmbeddedViews({
     destroy,
     destroyAll,
     forgetSessions,
+    setKeepLogins,
+    sweepOldLogins,
+    loginState,
     handleCertificateError,
   };
 }
