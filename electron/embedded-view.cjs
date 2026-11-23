@@ -216,9 +216,9 @@ function createEmbeddedViews({
   }
 
   // The shared session a target's view uses, or null for one of its own.
-  function partitionFor(target, url) {
+  function partitionFor(target, url, memory = false) {
     if (!target.userId || isLoopbackHost(url.hostname)) return null;
-    const stored = isStoring() ? storedKey() : null;
+    const stored = !memory && isStoring() ? storedKey() : null;
     if (stored) {
       const scope = JSON.stringify([
         "embedded-login",
@@ -360,8 +360,16 @@ function createEmbeddedViews({
       }
     }
     const stored = [...sharedSessions].filter((s) => storedSessions.has(s));
+    // The renderer keeps its tab and never learns a view went away, so each
+    // stored page reopens in place, now in memory.
     for (const [id, entry] of [...views]) {
-      if (storedSessions.has(entry.session)) destroy(id);
+      if (!storedSessions.has(entry.session)) continue;
+      destroy(id);
+      try {
+        show(id, entry.target, entry.bounds, entry.visible, true);
+      } catch (error) {
+        log(`[embedded-view] reopening a page failed: ${error}`);
+      }
     }
     for (const isolated of stored) {
       sharedSessions.delete(isolated);
@@ -430,9 +438,15 @@ function createEmbeddedViews({
       if (!granted) return { success: false, error: "Unknown view grant" };
       target = granted;
     }
+    return show(id, target, options.bounds, options.visible !== false);
+  }
+
+  function show(id, target, bounds, visible, memory = false) {
+    const main = getMainWindow();
+    if (!main) throw new Error("No window to attach a view to");
     const url = isolatedUrl(target.url);
     const ignoreCert = target.ignoreCert === true;
-    const partition = partitionFor(target, url);
+    const partition = partitionFor(target, url, memory);
     const existing = views.get(id);
     if (existing) {
       if (
@@ -440,8 +454,8 @@ function createEmbeddedViews({
         existing.ignoreCert === ignoreCert &&
         existing.partition === partition
       ) {
-        setBounds(id, options.bounds);
-        setVisible(id, options.visible !== false);
+        setBounds(id, bounds);
+        setVisible(id, visible);
         return { success: true };
       }
       destroy(id);
@@ -474,6 +488,9 @@ function createEmbeddedViews({
       view,
       session: isolated,
       partition,
+      target,
+      bounds,
+      visible,
       url: url.href,
       origin: url.origin,
       ignoreCert,
@@ -514,20 +531,24 @@ function createEmbeddedViews({
 
     views.set(id, entry);
     main.contentView.addChildView(view);
-    setBounds(id, options.bounds);
-    setVisible(id, options.visible !== false);
+    setBounds(id, bounds);
+    setVisible(id, visible);
     view.webContents.loadURL(url.href).catch(() => {});
     return { success: true };
   }
 
   function setBounds(id, bounds) {
     const entry = views.get(id);
-    if (entry) entry.view.setBounds(cleanBounds(bounds));
+    if (!entry) return;
+    entry.bounds = cleanBounds(bounds);
+    entry.view.setBounds(entry.bounds);
   }
 
   function setVisible(id, visible) {
     const entry = views.get(id);
-    if (entry) entry.view.setVisible(!!visible);
+    if (!entry) return;
+    entry.visible = !!visible;
+    entry.view.setVisible(entry.visible);
   }
 
   function handleCertificateError(event, contents, url, callback) {

@@ -842,6 +842,43 @@ describe("stored logins", () => {
     expect(fs.existsSync(neverOpened)).toBe(false);
   });
 
+  it("switching off reopens a stored page in its tab, in memory", () => {
+    start();
+    manager.setKeepLogins(true);
+    const stored = openGranted("tab", "https://pi.example/dash");
+    const oldView = views[views.length - 1];
+    manager.setBounds("tab", { x: 1, y: 2, width: 640, height: 480 });
+    manager.setVisible("tab", false);
+    // A tab the renderer already closed stays closed.
+    openGranted("closed", "https://other.example/");
+    manager.destroy("closed");
+    const before = views.length;
+
+    expect(manager.setKeepLogins(false)).toEqual({ success: true });
+
+    expect(oldView.webContents.close).toHaveBeenCalled();
+    expect(views.length).toBe(before + 1);
+    const newView = views[views.length - 1];
+    expect(contentView.addChildView).toHaveBeenLastCalledWith(newView);
+    expect(newView.webContents.loadURL).toHaveBeenCalledWith(
+      "https://pi.example/dash",
+    );
+    expect(newView.setBounds).toHaveBeenLastCalledWith({
+      x: 1,
+      y: 2,
+      width: 640,
+      height: 480,
+    });
+    expect(newView.setVisible).toHaveBeenLastCalledWith(false);
+    const name =
+      fromPartition.mock.calls[fromPartition.mock.calls.length - 1][0];
+    expect(name).toMatch(/^embedded-login-[0-9a-f]{64}$/);
+    expect(sessionOf(newView)).not.toBe(sessions.get(stored));
+    // The renderer keeps driving the same id.
+    manager.setVisible("tab", true);
+    expect(newView.setVisible).toHaveBeenLastCalledWith(true);
+  });
+
   it("signing out retires the key at once and clears every session, as #1926 does", async () => {
     start();
     manager.setKeepLogins(true);
